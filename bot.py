@@ -476,10 +476,10 @@ async def cmd_search(message: Message) -> None:
     token = group["search_token"]
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Search stickers", switch_inline_query_current_chat=f"g:{token} ")]
+            [InlineKeyboardButton(text="🔎 Search stickers", switch_inline_query_current_chat=f"g:{token}")]
         ]
     )
-    await message.answer("Tap below, then type an emoji or pack name.", reply_markup=keyboard)
+    await message.answer("Tap below. Stickers will appear instantly; type an emoji or pack name only if you want to filter them.", reply_markup=keyboard)
 
 
 @router.message(Command("limit"))
@@ -571,23 +571,46 @@ async def inline_search(query: InlineQuery) -> None:
         return
 
     needle = search.casefold()
-    results: list[InlineQueryResultCachedSticker] = []
+
+    # Build all matching candidates first. When the user does not type a search
+    # term, this intentionally means every sticker from every pack enabled in
+    # this group is eligible. /search injects only the private group token, so
+    # stickers appear immediately without requiring an emoji/word.
+    candidates: list[tuple[str, dict[str, Any]]] = []
     async for pack in db.packs.find({"name": {"$in": allowed}}):
-        pack_match = needle and (needle in pack.get("name", "").casefold() or needle in pack.get("title", "").casefold())
+        pack_match = bool(needle) and (
+            needle in pack.get("name", "").casefold()
+            or needle in pack.get("title", "").casefold()
+        )
         for sticker in pack.get("stickers", []):
             emoji = sticker.get("emoji", "")
             if needle and not pack_match and needle not in emoji.casefold():
                 continue
-            result_id = hashlib.sha1(f"{pack['name']}:{sticker['file_unique_id']}".encode()).hexdigest()[:32]
-            results.append(InlineQueryResultCachedSticker(id=result_id, sticker_file_id=sticker["file_id"]))
-            if len(results) >= 50:
-                break
-        if len(results) >= 50:
-            break
+            candidates.append((pack["name"], sticker))
+
+    # Keep empty-query results useful: show stickers from the allowed packs
+    # immediately and support scrolling through more than the first 50.
+    try:
+        start = max(0, int(query.offset or "0"))
+    except ValueError:
+        start = 0
+    page = candidates[start:start + 50]
+
+    results: list[InlineQueryResultCachedSticker] = []
+    for pack_name, sticker in page:
+        result_id = hashlib.sha1(f"{pack_name}:{sticker['file_unique_id']}".encode()).hexdigest()[:32]
+        results.append(InlineQueryResultCachedSticker(id=result_id, sticker_file_id=sticker["file_id"]))
+
+    next_offset = str(start + 50) if start + 50 < len(candidates) else ""
 
     await bump_group(group["chat_id"], inline_queries=1)
     await bump_daily(group["chat_id"], inline_queries=1)
-    await query.answer(results, cache_time=1, is_personal=True)
+    await query.answer(
+        results,
+        cache_time=1,
+        is_personal=True,
+        next_offset=next_offset,
+    )
 
 
 @router.my_chat_member()
@@ -623,6 +646,12 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         return
 
     group = await ensure_group(message.chat)
+
+    # Group owner and /auth-authorized admins may send stickers directly.
+    # Normal Telegram admins are NOT exempt unless the owner authorized them.
+    if message.sticker and message.from_user and await can_manage(message.chat.id, message.from_user.id):
+        await record_allowed_sticker(message)
+        return
 
     # Any inline result from another bot is removed, regardless of media type.
     if message.via_bot and message.via_bot.id != BOT_ID:
