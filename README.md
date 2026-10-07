@@ -171,3 +171,9 @@ During Blueprint setup, provide these secret values when Render asks for them:
 `PORT` does not need to be configured. Render supplies it automatically and the bot listens on `0.0.0.0:$PORT`.
 
 > If you rename the service from `stickerpal-bot` inside `render.yaml`, change the `fromService.name` value to the same name too.
+
+
+### Webhook fallback
+
+Webhook mode is enabled only when **both** `WEBHOOK_URL` and `WEBHOOK_SECRET` are set.
+If `WEBHOOK_SECRET` is empty or missing, the bot automatically deletes any old Telegram webhook and starts in **long-polling mode** while keeping the HTTP `/`, `/health`, and `/status` endpoints online for Render.

@@ -45,6 +45,7 @@ if _raw_webhook_url and "://" not in _raw_webhook_url:
     _raw_webhook_url = f"https://{_raw_webhook_url}"
 WEBHOOK_URL = _raw_webhook_url or (f"https://{RENDER_EXTERNAL_HOSTNAME}" if RENDER_EXTERNAL_HOSTNAME else "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+WEBHOOK_ENABLED = bool(WEBHOOK_URL and WEBHOOK_SECRET)
 PORT = int(os.environ.get("PORT", "10000"))
 STARTED_AT = datetime.now(timezone.utc)
 
@@ -1122,7 +1123,7 @@ async def health_handler(_: web.Request) -> web.Response:
             "ok": True,
             "status": "online",
             "bot": f"@{BOT_USERNAME}" if BOT_USERNAME else "starting",
-            "mode": "webhook" if WEBHOOK_URL else "polling",
+            "mode": "webhook" if WEBHOOK_ENABLED else "polling",
             "uptime_seconds": uptime_seconds(),
             "port": PORT,
         }
@@ -1131,7 +1132,7 @@ async def health_handler(_: web.Request) -> web.Response:
 
 async def status_page_handler(_: web.Request) -> web.Response:
     bot_name = f"@{html.escape(BOT_USERNAME)}" if BOT_USERNAME else "starting"
-    mode = "Webhook" if WEBHOOK_URL else "Polling"
+    mode = "Webhook" if WEBHOOK_ENABLED else "Polling"
     body = f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -1209,9 +1210,11 @@ async def main() -> None:
     await configure_bot()
     log.info("Started @%s (%s)", BOT_USERNAME, BOT_ID)
     try:
-        if WEBHOOK_URL:
+        if WEBHOOK_ENABLED:
             await run_webhook()
         else:
+            if WEBHOOK_URL and not WEBHOOK_SECRET:
+                log.warning("WEBHOOK_SECRET is empty; falling back to polling mode.")
             await run_polling()
     finally:
         await bot.session.close()
