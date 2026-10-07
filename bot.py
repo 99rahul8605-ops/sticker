@@ -341,9 +341,12 @@ async def send_sticker_tutorial(message: Message, group: dict[str, Any]) -> None
     try:
         sent = await bot.send_message(
             message.chat.id,
-            f"{mention}, direct stickers are not allowed in this group.\n\n"
-            f"Use the approved sticker search instead. Group code: <code>{html.escape(code)}</code>\n"
-            "Tap the button below, then choose a sticker. You can also type an emoji or pack name to filter results.",
+            "<b>How to send stickers</b>\n\n"
+            f"{mention}, direct stickers are not allowed in this group.\n"
+            f"Group code: <code>{html.escape(code)}</code>\n\n"
+            "Tap <b>Open Sticker Search</b> below. The group's code will be filled in automatically, "
+            "so you can choose an approved sticker immediately. You can also type an emoji or pack name to filter results.\n\n"
+            "This message will be removed automatically in 5 minutes.",
             reply_markup=keyboard,
         )
         asyncio.create_task(delete_message_later(message.chat.id, sent.message_id))
@@ -415,7 +418,32 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     if message.chat.type == ChatType.PRIVATE:
         await touch_dm_user(message.from_user)
+        await message.answer(
+            "<b>Sticker Guard</b>\n\n"
+            "Add me to a group as an admin with <b>Delete messages</b> permission. "
+            "Each group gets its own sticker code and approved sticker packs.\n\n"
+            "Use the group commands inside the group."
+        )
+        return
+
+    if message.chat.type not in GROUP_TYPES:
+        return
+
+    group = await ensure_group(message.chat)
+    code = group["group_code"]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Open Sticker Search",
+                switch_inline_query_current_chat=f"{code} ",
+            )
+        ]]
+    )
     await message.answer(
+        "<b>How to send stickers</b>\n\n"
+        f"Group code: <code>{html.escape(code)}</code>\n"
+        "Tap <b>Open Sticker Search</b> below to open the approved sticker library with this group's code already filled in. "
+        "You can also type an emoji or pack name after the code to filter stickers.\n\n"
         "<b>Group commands</b>\n"
         "/add — add pack (reply to a sticker or give pack link/name)\n"
         "/rm — remove pack\n"
@@ -428,7 +456,8 @@ async def cmd_help(message: Message) -> None:
         "/stats — group stats\n"
         "/top — top packs/emojis\n"
         "/limit — view/set rate limit, e.g. <code>/limit 5 30</code>\n\n"
-        "Only the owner or an authorized Telegram admin can add/remove packs or change the group code."
+        "Only the group owner or an owner-authorized Telegram admin can add/remove packs or change the group code.",
+        reply_markup=keyboard,
     )
 
 
