@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import io
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    ChatPermissions,
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -81,10 +83,29 @@ TUTORIAL_TTL = 300
 INLINE_HELP_MARKER = "[StickerGuard:help]"
 INLINE_INVALID_MARKER = "[StickerGuard:invalid]"
 
+# NudeNet runs locally on the bot server. The 320px bundled model is used by
+# default to keep CPU/RAM usage reasonable on small Render instances.
+NSFW_BLOCK_LABELS = {
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "FEMALE_BREAST_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+    "ANUS_EXPOSED",
+}
+NSFW_DEFAULT_THRESHOLD = 0.85
+NSFW_DEFAULT_MUTE_SECONDS = 3600
+NSFW_NOTICE_TTL = 60
+NSFW_MAX_FILE_BYTES = 10 * 1024 * 1024
+NSFW_CACHE_VERSION = "nudenet-320-v1"
+
 # In-memory burst limiter and tutorial anti-spam state. Mongo stores long-term stats.
 rate_windows: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 tutorial_last_sent: dict[tuple[int, int], float] = {}
 tutorial_message_ids: dict[tuple[int, int], int] = {}
+_nsfw_detector: Any | None = None
+_nsfw_detector_failed = False
+_nsfw_load_lock = asyncio.Lock()
+_nsfw_inference_lock = asyncio.Lock()
 
 
 def utcnow() -> datetime:
@@ -129,6 +150,19 @@ async def init_db() -> None:
     await db.activity.create_index("expire_at", expireAfterSeconds=0)
     await db.errors.create_index([("created_at", DESCENDING)])
     await db.errors.create_index("expire_at", expireAfterSeconds=0)
+    await db.nsfw_cache.create_index([("media_key", ASCENDING)], unique=True)
+    await db.nsfw_cache.create_index([("updated_at", DESCENDING)])
+
+    # Existing groups get safe defaults without requiring a DB reset.
+    await db.groups.update_many(
+        {"nsfw_enabled": {"$exists": False}},
+        {"$set": {
+            "nsfw_enabled": True,
+            "nsfw_action": "mute",
+            "nsfw_mute_seconds": NSFW_DEFAULT_MUTE_SECONDS,
+            "nsfw_threshold": NSFW_DEFAULT_THRESHOLD,
+        }},
+    )
 
     # Backfill codes for groups created by older versions of the bot.
     async for row in db.groups.find({"group_code": {"$exists": False}}, {"chat_id": 1}):
@@ -178,6 +212,10 @@ async def ensure_group(chat: Any) -> dict[str, Any]:
             "group_code": code,
             "limit_count": 5,
             "limit_window": 30,
+            "nsfw_enabled": True,
+            "nsfw_action": "mute",
+            "nsfw_mute_seconds": NSFW_DEFAULT_MUTE_SECONDS,
+            "nsfw_threshold": NSFW_DEFAULT_THRESHOLD,
             "stats": {
                 "inline_queries": 0,
                 "stickers_sent": 0,
@@ -186,6 +224,8 @@ async def ensure_group(chat: Any) -> dict[str, Any]:
                 "rate_deleted": 0,
                 "packs_added": 0,
                 "packs_removed": 0,
+                "nsfw_deleted": 0,
+                "nsfw_actions": 0,
             },
         }
         try:
@@ -325,6 +365,229 @@ async def delete_message_later(chat_id: int, message_id: int, delay: int = TUTOR
         pass
 
 
+def nsfw_settings(group: dict[str, Any]) -> tuple[bool, str, int, float]:
+    enabled = bool(group.get("nsfw_enabled", True))
+    action = str(group.get("nsfw_action", "mute"))
+    mute_seconds = int(group.get("nsfw_mute_seconds", NSFW_DEFAULT_MUTE_SECONDS))
+    threshold = float(group.get("nsfw_threshold", NSFW_DEFAULT_THRESHOLD))
+    return enabled, action, mute_seconds, threshold
+
+
+def _build_nsfw_detector() -> Any:
+    from nudenet import NudeDetector
+    return NudeDetector()
+
+
+async def get_nsfw_detector() -> Any | None:
+    global _nsfw_detector, _nsfw_detector_failed
+    if _nsfw_detector is not None:
+        return _nsfw_detector
+    if _nsfw_detector_failed:
+        return None
+    async with _nsfw_load_lock:
+        if _nsfw_detector is not None:
+            return _nsfw_detector
+        if _nsfw_detector_failed:
+            return None
+        try:
+            _nsfw_detector = await asyncio.to_thread(_build_nsfw_detector)
+            log.info("NSFW detector loaded (NudeNet bundled 320px model)")
+        except Exception as exc:
+            _nsfw_detector_failed = True
+            log.exception("Could not load NSFW detector: %s", exc)
+            return None
+    return _nsfw_detector
+
+
+def nsfw_scan_target(message: Message) -> tuple[str, str, str] | None:
+    # cache_key, Telegram file_id, source description
+    if message.photo:
+        media = message.photo[-1]
+        return f"photo:{media.file_unique_id}", media.file_id, "photo"
+
+    if message.sticker:
+        sticker = message.sticker
+        key = f"sticker:{sticker.file_unique_id}"
+        if not sticker.is_animated and not sticker.is_video:
+            return key, sticker.file_id, "sticker"
+        thumb = sticker.thumbnail
+        if thumb:
+            return key, thumb.file_id, "sticker_thumbnail"
+        return None
+
+    if message.document:
+        doc = message.document
+        mime = (doc.mime_type or "").lower()
+        if not mime.startswith("image/"):
+            return None
+        if doc.file_size and doc.file_size > NSFW_MAX_FILE_BYTES:
+            return None
+        return f"document:{doc.file_unique_id}", doc.file_id, "image_document"
+
+    if message.animation:
+        anim = message.animation
+        thumb = anim.thumbnail
+        if thumb:
+            return f"animation:{anim.file_unique_id}", thumb.file_id, "animation_thumbnail"
+        return None
+
+    return None
+
+
+async def download_telegram_file(file_id: str) -> bytes:
+    tg_file = await bot.get_file(file_id)
+    if not tg_file.file_path:
+        raise RuntimeError("Telegram returned no file path")
+    buffer = io.BytesIO()
+    await bot.download_file(tg_file.file_path, destination=buffer)
+    return buffer.getvalue()
+
+
+async def scan_message_nsfw(message: Message, threshold: float) -> dict[str, Any] | None:
+    target = nsfw_scan_target(message)
+    if not target:
+        return None
+    media_key, file_id, source = target
+
+    cached = await db.nsfw_cache.find_one(
+        {"media_key": media_key, "version": NSFW_CACHE_VERSION},
+        {"max_score": 1, "label": 1, "source": 1},
+    )
+    if cached is not None:
+        score = float(cached.get("max_score", 0.0))
+        return {
+            "unsafe": score >= threshold,
+            "score": score,
+            "label": cached.get("label") or "",
+            "source": cached.get("source") or source,
+            "cached": True,
+            "media_key": media_key,
+        }
+
+    detector = await get_nsfw_detector()
+    if detector is None:
+        return None
+
+    try:
+        data = await download_telegram_file(file_id)
+        if len(data) > NSFW_MAX_FILE_BYTES:
+            return None
+        async with _nsfw_inference_lock:
+            detections = await asyncio.to_thread(detector.detect, data, score_threshold=0.25)
+    except Exception as exc:
+        log.warning("NSFW scan failed for %s: %s", media_key, exc)
+        return None
+
+    blocked = [d for d in detections if str(d.get("class", "")) in NSFW_BLOCK_LABELS]
+    if blocked:
+        strongest = max(blocked, key=lambda item: float(item.get("score", 0.0)))
+        max_score = float(strongest.get("score", 0.0))
+        label = str(strongest.get("class", ""))
+    else:
+        max_score = 0.0
+        label = ""
+
+    await db.nsfw_cache.update_one(
+        {"media_key": media_key},
+        {"$set": {
+            "media_key": media_key,
+            "version": NSFW_CACHE_VERSION,
+            "max_score": max_score,
+            "label": label,
+            "source": source,
+            "updated_at": utcnow(),
+        }},
+        upsert=True,
+    )
+    return {
+        "unsafe": max_score >= threshold,
+        "score": max_score,
+        "label": label,
+        "source": source,
+        "cached": False,
+        "media_key": media_key,
+    }
+
+
+async def send_nsfw_notice(message: Message, action_text: str) -> None:
+    try:
+        sent = await bot.send_message(
+            message.chat.id,
+            f"🛡️ <b>Unsafe media removed.</b> {html.escape(action_text)}\n"
+            "This automated check can make mistakes; the event was logged.",
+        )
+        asyncio.create_task(delete_message_later(message.chat.id, sent.message_id, NSFW_NOTICE_TTL))
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+
+
+async def apply_nsfw_violation(
+    message: Message,
+    group: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    punish_user: bool = True,
+) -> None:
+    await safe_delete(message)
+    await bump_group(message.chat.id, nsfw_deleted=1)
+    await bump_daily(message.chat.id, nsfw_deleted=1)
+
+    # If an unsafe sticker was ever present in an approved snapshot, remove it
+    # from the stored snapshot so the bot stops offering it in inline results.
+    if message.sticker:
+        await db.packs.update_many(
+            {"stickers.file_unique_id": message.sticker.file_unique_id},
+            {"$pull": {"stickers": {"file_unique_id": message.sticker.file_unique_id}}},
+        )
+
+    user = message.from_user
+    score = float(result.get("score", 0.0))
+    label = str(result.get("label", "unknown"))
+    await log_activity(
+        "nsfw_removed",
+        chat=message.chat,
+        user=user,
+        details=f"label={label} score={score:.3f} source={result.get('source', '')}",
+    )
+
+    if not user or user.is_bot or not punish_user:
+        await send_nsfw_notice(message, "No user penalty was applied.")
+        return
+
+    status = await get_member_status(message.chat.id, user.id)
+    if status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}:
+        await send_nsfw_notice(message, "The sender is a Telegram admin, so no automatic restriction was applied.")
+        return
+
+    _, action, mute_seconds, _ = nsfw_settings(group)
+    action_text = "The content was deleted."
+    action_applied = False
+    try:
+        if action == "ban":
+            await bot.ban_chat_member(message.chat.id, user.id)
+            action_text = f"{user.full_name} was banned."
+            action_applied = True
+        else:
+            until = utcnow() + timedelta(seconds=mute_seconds)
+            await bot.restrict_chat_member(
+                message.chat.id,
+                user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            minutes = max(1, mute_seconds // 60)
+            action_text = f"{user.full_name} was muted for {minutes} minute{'s' if minutes != 1 else ''}."
+            action_applied = True
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        log.warning("Could not apply NSFW action in %s to %s: %s", message.chat.id, user.id, exc)
+        action_text = "The content was deleted, but the bot could not restrict the sender. Check the bot's admin permissions."
+
+    if action_applied:
+        await bump_group(message.chat.id, nsfw_actions=1)
+        await bump_daily(message.chat.id, nsfw_actions=1)
+    await send_nsfw_notice(message, action_text)
+
+
 async def send_sticker_tutorial(
     message: Message,
     group: dict[str, Any],
@@ -440,8 +703,8 @@ async def cmd_start(message: Message) -> None:
     await touch_dm_user(message.from_user)
     await message.answer(
         "<b>Sticker Guard</b>\n\n"
-        "Add me to a group as admin with <b>Delete messages</b> permission. "
-        "Then the group owner can add approved sticker packs with /add.\n\n"
+        "Add me to a group as admin with <b>Delete messages</b> and <b>Ban users</b> permissions. "
+        "Then the group owner can add approved sticker packs with /add. NSFW protection is enabled by default.\n\n"
         "Use /help for commands."
     )
 
@@ -452,8 +715,8 @@ async def cmd_help(message: Message) -> None:
         await touch_dm_user(message.from_user)
         await message.answer(
             "<b>Sticker Guard</b>\n\n"
-            "Add me to a group as an admin with <b>Delete messages</b> permission. "
-            "Each group gets its own sticker code and approved sticker packs.\n\n"
+            "Add me to a group as an admin with <b>Delete messages</b> and <b>Ban users</b> permissions. "
+            "Each group gets its own sticker code, approved sticker packs, and local NSFW media protection.\n\n"
             "Use the group commands inside the group."
         )
         return
@@ -487,7 +750,8 @@ async def cmd_help(message: Message) -> None:
         "/search — open this group's inline sticker search\n"
         "/stats — group stats\n"
         "/top — top packs/emojis\n"
-        "/limit — view/set rate limit, e.g. <code>/limit 5 30</code>\n\n"
+        "/limit — view/set rate limit, e.g. <code>/limit 5 30</code>\n"
+        "/safe — NSFW protection settings\n\n"
         "Only the group owner or an owner-authorized Telegram admin can add/remove packs or change the group code.",
         reply_markup=keyboard,
     )
@@ -710,6 +974,78 @@ async def cmd_limit(message: Message) -> None:
     await message.answer(f"✅ Limit set to <b>{count}</b> stickers / <b>{window}</b> sec per user.")
 
 
+@router.message(Command("safe"))
+async def cmd_safe(message: Message) -> None:
+    if not await require_group(message):
+        return
+    group = await ensure_group(message.chat)
+    arg = command_arg(message).strip().lower()
+    enabled, action, mute_seconds, threshold = nsfw_settings(group)
+
+    if not arg:
+        action_label = "permanent ban" if action == "ban" else f"{max(1, mute_seconds // 60)} minute mute"
+        await message.answer(
+            "<b>🛡️ NSFW protection</b>\n\n"
+            f"Status: <b>{'ON' if enabled else 'OFF'}</b>\n"
+            f"Action: <b>{html.escape(action_label)}</b>\n"
+            f"Detection threshold: <b>{threshold:.2f}</b>\n\n"
+            "Scans photos, image documents and stickers. Animated/video stickers and GIFs are checked using their Telegram thumbnail.\n\n"
+            "Managers: <code>/safe on</code>, <code>/safe off</code>, <code>/safe mute 60</code>, "
+            "<code>/safe ban</code>, <code>/safe threshold 0.85</code>."
+        )
+        return
+
+    if not message.from_user or not await can_manage(message.chat.id, message.from_user.id):
+        await message.answer("❌ Only the group owner or an authorized admin can change NSFW protection.")
+        return
+
+    parts = arg.split()
+    if parts[0] in {"on", "off"} and len(parts) == 1:
+        value = parts[0] == "on"
+        await db.groups.update_one({"chat_id": message.chat.id}, {"$set": {"nsfw_enabled": value}})
+        await message.answer(f"✅ NSFW protection is now <b>{'ON' if value else 'OFF'}</b>.")
+        return
+
+    if parts[0] == "ban" and len(parts) == 1:
+        await db.groups.update_one({"chat_id": message.chat.id}, {"$set": {"nsfw_action": "ban"}})
+        await message.answer("✅ NSFW action set to <b>permanent ban</b>.")
+        return
+
+    if parts[0] == "mute":
+        minutes = 60
+        if len(parts) == 2:
+            try:
+                minutes = int(parts[1])
+            except ValueError:
+                minutes = 0
+        if not (1 <= minutes <= 10080):
+            await message.answer("Use <code>/safe mute MINUTES</code> (1-10080).")
+            return
+        await db.groups.update_one(
+            {"chat_id": message.chat.id},
+            {"$set": {"nsfw_action": "mute", "nsfw_mute_seconds": minutes * 60}},
+        )
+        await message.answer(f"✅ NSFW action set to a <b>{minutes} minute mute</b>.")
+        return
+
+    if parts[0] == "threshold" and len(parts) == 2:
+        try:
+            value = float(parts[1])
+        except ValueError:
+            value = 0.0
+        if not (0.50 <= value <= 0.99):
+            await message.answer("Use <code>/safe threshold 0.85</code> (0.50-0.99). Higher values reduce false positives.")
+            return
+        await db.groups.update_one({"chat_id": message.chat.id}, {"$set": {"nsfw_threshold": value}})
+        await message.answer(f"✅ NSFW threshold set to <b>{value:.2f}</b>.")
+        return
+
+    await message.answer(
+        "Usage: <code>/safe on</code>, <code>/safe off</code>, <code>/safe mute 60</code>, "
+        "<code>/safe ban</code>, or <code>/safe threshold 0.85</code>."
+    )
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
     if not await require_group(message):
@@ -727,7 +1063,9 @@ async def cmd_stats(message: Message) -> None:
         f"Inline searches: <b>{stats.get('inline_queries', 0)}</b> (today {today.get('inline_queries', 0)})\n"
         f"Unauthorized stickers deleted: <b>{stats.get('deleted_stickers', 0)}</b>\n"
         f"Other-bot inline messages deleted: <b>{stats.get('deleted_inline', 0)}</b>\n"
-        f"Rate-limit deletions: <b>{stats.get('rate_deleted', 0)}</b>"
+        f"Rate-limit deletions: <b>{stats.get('rate_deleted', 0)}</b>\n"
+        f"NSFW media removed: <b>{stats.get('nsfw_deleted', 0)}</b> (today {today.get('nsfw_deleted', 0)})\n"
+        f"NSFW restrictions/bans: <b>{stats.get('nsfw_actions', 0)}</b>"
     )
 
 
@@ -875,6 +1213,30 @@ async def record_allowed_sticker(message: Message) -> None:
         await bump_usage(message.chat.id, "emoji", sticker.emoji)
 
 
+@router.message(F.photo | F.document | F.animation)
+async def nsfw_media_moderation(message: Message) -> None:
+    if message.chat.type == ChatType.PRIVATE:
+        await touch_dm_user(message.from_user)
+        return
+    if message.chat.type not in GROUP_TYPES:
+        return
+
+    group = await ensure_group(message.chat)
+    enabled, _, _, threshold = nsfw_settings(group)
+    if enabled:
+        result = await scan_message_nsfw(message, threshold)
+        if result and result.get("unsafe"):
+            await apply_nsfw_violation(message, group, result)
+            return
+
+    # Keep the existing policy: inline media from other bots is not allowed.
+    if message.via_bot and message.via_bot.id != BOT_ID:
+        if await safe_delete(message):
+            await bump_group(message.chat.id, deleted_inline=1)
+            await bump_daily(message.chat.id, deleted_inline=1)
+        return
+
+
 @router.message(F.sticker | F.via_bot)
 async def moderation_and_dm_catchall(message: Message) -> None:
     if message.chat.type == ChatType.PRIVATE:
@@ -884,6 +1246,17 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         return
 
     group = await ensure_group(message.chat)
+
+    enabled, _, _, threshold = nsfw_settings(group)
+    if message.sticker and enabled:
+        result = await scan_message_nsfw(message, threshold)
+        if result and result.get("unsafe"):
+            # If this sticker came from our own approved inline library, delete
+            # it and remove it from the snapshot, but do not punish the user for
+            # selecting something the bot itself offered.
+            punish = not (message.via_bot and message.via_bot.id == BOT_ID)
+            await apply_nsfw_violation(message, group, result, punish_user=punish)
+            return
 
     # Inline help results cannot know the destination group while the user is
     # browsing. Once the result is posted here, we do know the chat ID, so
@@ -973,7 +1346,7 @@ async def cmd_bstats(message: Message) -> None:
         today_rows.append(row)
     today = defaultdict(int)
     for row in today_rows:
-        for key in ("stickers_sent", "inline_queries", "deleted_stickers", "deleted_inline", "rate_deleted", "packs_added", "packs_removed"):
+        for key in ("stickers_sent", "inline_queries", "deleted_stickers", "deleted_inline", "rate_deleted", "packs_added", "packs_removed", "nsfw_deleted", "nsfw_actions"):
             today[key] += int(row.get(key, 0))
     new_users_today = await db.users.count_documents({"first_seen": {"$gte": utcnow() - timedelta(days=1)}})
     await message.answer(
@@ -1085,6 +1458,7 @@ async def configure_bot() -> None:
             BotCommand(command="stats", description="Group sticker stats"),
             BotCommand(command="top", description="Top packs and emojis"),
             BotCommand(command="limit", description="View or set sticker rate limit"),
+            BotCommand(command="safe", description="NSFW protection settings"),
             BotCommand(command="help", description="Show help"),
         ],
         scope=BotCommandScopeAllGroupChats(),
