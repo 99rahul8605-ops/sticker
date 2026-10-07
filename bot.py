@@ -39,9 +39,14 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 DB_NAME = os.environ.get("DB_NAME", "sticker_guard").strip()
 BOT_OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "0") or 0)
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")
+RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+_raw_webhook_url = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")
+if _raw_webhook_url and "://" not in _raw_webhook_url:
+    _raw_webhook_url = f"https://{_raw_webhook_url}"
+WEBHOOK_URL = _raw_webhook_url or (f"https://{RENDER_EXTERNAL_HOSTNAME}" if RENDER_EXTERNAL_HOSTNAME else "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 PORT = int(os.environ.get("PORT", "10000"))
+STARTED_AT = datetime.now(timezone.utc)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -1107,8 +1112,70 @@ async def webhook_handler(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+def uptime_seconds() -> int:
+    return max(0, int((utcnow() - STARTED_AT).total_seconds()))
+
+
 async def health_handler(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "bot": BOT_USERNAME or "starting"})
+    return web.json_response(
+        {
+            "ok": True,
+            "status": "online",
+            "bot": f"@{BOT_USERNAME}" if BOT_USERNAME else "starting",
+            "mode": "webhook" if WEBHOOK_URL else "polling",
+            "uptime_seconds": uptime_seconds(),
+            "port": PORT,
+        }
+    )
+
+
+async def status_page_handler(_: web.Request) -> web.Response:
+    bot_name = f"@{html.escape(BOT_USERNAME)}" if BOT_USERNAME else "starting"
+    mode = "Webhook" if WEBHOOK_URL else "Polling"
+    body = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+  <title>Sticker Guard Status</title>
+  <style>
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:system-ui,-apple-system,sans-serif; background:#f6f8fb; color:#172033; }}
+    .card {{ width:min(420px,calc(100% - 32px)); padding:28px; border-radius:20px; background:white; box-shadow:0 12px 40px rgba(20,40,80,.10); text-align:center; }}
+    .dot {{ display:inline-block; width:10px; height:10px; margin-right:7px; border-radius:50%; background:#22c55e; }}
+    h1 {{ margin:0 0 10px; font-size:26px; }}
+    p {{ margin:8px 0; color:#5b6475; }}
+    code {{ padding:3px 7px; border-radius:7px; background:#eef2f7; }}
+  </style>
+</head>
+<body>
+  <main class=\"card\">
+    <h1>Sticker Guard</h1>
+    <p><span class=\"dot\"></span><strong>Online</strong></p>
+    <p>Bot: <code>{bot_name}</code></p>
+    <p>Mode: <code>{mode}</code></p>
+    <p>Uptime: <code>{uptime_seconds()}s</code></p>
+  </main>
+</body>
+</html>"""
+    return web.Response(text=body, content_type="text/html")
+
+
+async def start_http_server(*, include_webhook: bool) -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", status_page_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/status", health_handler)
+    if include_webhook:
+        app.router.add_post("/telegram/webhook", webhook_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Status server listening on 0.0.0.0:%s", PORT)
+    if RENDER_EXTERNAL_HOSTNAME:
+        log.info("Public status URL: https://%s/", RENDER_EXTERNAL_HOSTNAME)
+    return runner
 
 
 async def run_webhook() -> None:
@@ -1119,17 +1186,20 @@ async def run_webhook() -> None:
         allowed_updates=dp.resolve_used_update_types(),
         drop_pending_updates=False,
     )
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-    app.router.add_post("/telegram/webhook", webhook_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    runner = await start_http_server(include_webhook=True)
     log.info("Webhook mode active on port %s -> %s", PORT, webhook)
     try:
         await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
+async def run_polling() -> None:
+    await bot.delete_webhook(drop_pending_updates=False)
+    runner = await start_http_server(include_webhook=False)
+    log.info("Polling mode active with status server on port %s", PORT)
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await runner.cleanup()
 
@@ -1142,9 +1212,7 @@ async def main() -> None:
         if WEBHOOK_URL:
             await run_webhook()
         else:
-            await bot.delete_webhook(drop_pending_updates=False)
-            log.info("Polling mode active")
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            await run_polling()
     finally:
         await bot.session.close()
         await mongo.close()

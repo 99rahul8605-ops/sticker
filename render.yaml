@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: stickerpal-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: BOT_OWNER_ID
+        sync: false
+
+      - key: MONGO_URI
+        sync: false
+
+      - key: DB_NAME
+        value: sticker_guard
+
+      # Render exposes this service hostname as RENDER_EXTERNAL_HOSTNAME.
+      # We copy it into WEBHOOK_URL automatically; bot.py adds https://.
+      - key: WEBHOOK_URL
+        fromService:
+          name: stickerpal-bot
+          type: web
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+
+      # Add your own strong random value in the Render Blueprint setup/dashboard.
+      - key: WEBHOOK_SECRET
+        sync: false
+
+      - key: LOG_LEVEL
+        value: INFO

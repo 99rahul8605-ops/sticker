@@ -20,6 +20,7 @@ Telegram group sticker firewall with per-group approved sticker packs, short gro
 - Per-user sticker rate limiting is built in.
 - Group stats and bot-owner global stats are stored in MongoDB.
 - Activity/error logs expire automatically after 30 days.
+- A lightweight status server runs in both polling and webhook modes. `/` shows a live status page, while `/health` and `/status` return JSON.
 
 ## Commands
 
@@ -90,7 +91,7 @@ shows a global **How to send stickers** help result because Telegram does not pr
 ## BotFather setup
 
 1. Create the bot and copy its token.
-2. Enable inline mode with `/setinline` in BotFather. A placeholder such as `Enter group code or search stickers...` is fine.
+2. Enable inline mode with `/setinline` in BotFather. Set the inline placeholder to `Enter group code...`.
 3. Add the bot to each group as an admin.
 4. Give it **Delete messages** permission. Without this, moderation cannot work.
 
@@ -111,7 +112,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-With no `WEBHOOK_URL`, the bot automatically uses long polling.
+With no `WEBHOOK_URL`, the bot automatically uses long polling. The local status server still starts on `PORT` (default `10000`), so you can open `http://localhost:10000/`.
 
 ## Render deployment
 
@@ -128,7 +129,17 @@ WEBHOOK_URL=https://YOUR-SERVICE.onrender.com
 WEBHOOK_SECRET=a_long_random_AZaz09_-_secret
 ```
 
-Render supplies `PORT`; the Docker app binds to it and exposes `/health`.
+Render supplies `PORT`; the app reads it automatically and binds the status/webhook server to `0.0.0.0:$PORT`. The Dockerfile also documents the default port with `EXPOSE 10000`.
+
+Public endpoints:
+
+```text
+https://YOUR-SERVICE.onrender.com/
+https://YOUR-SERVICE.onrender.com/health
+https://YOUR-SERVICE.onrender.com/status
+```
+
+The app itself uses HTTP internally. Render terminates HTTPS/TLS at its load balancer and forwards the request to the app, so you do not need SSL certificate files in the bot.
 
 After the service starts, the bot automatically sets its Telegram webhook to:
 
@@ -143,3 +154,20 @@ Custom-emoji packs are intentionally rejected for now. Regular, animated, and vi
 ### Inline help behavior
 
 Typing only `@YourBot` shows a **How to send stickers** inline result. When that result is selected inside a group, the bot replaces it with a group-specific tutorial containing the current group code and an **Open Sticker Search** button. The button reopens inline mode with the code already filled in. Invalid-code help uses the same recovery flow.
+
+## Render Blueprint (`render.yaml`)
+
+This project includes a `render.yaml` for one-click/Blueprint deployment as a Render Web Service.
+
+The Blueprint automatically copies Render's built-in `RENDER_EXTERNAL_HOSTNAME` into `WEBHOOK_URL`. The bot accepts a hostname-only value and converts it to `https://<hostname>`, so you do **not** need to manually paste your Render URL.
+
+During Blueprint setup, provide these secret values when Render asks for them:
+
+- `BOT_TOKEN`
+- `BOT_OWNER_ID`
+- `MONGO_URI`
+- `WEBHOOK_SECRET`
+
+`PORT` does not need to be configured. Render supplies it automatically and the bot listens on `0.0.0.0:$PORT`.
+
+> If you rename the service from `stickerpal-bot` inside `render.yaml`, change the `fromService.name` value to the same name too.
