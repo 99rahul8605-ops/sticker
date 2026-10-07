@@ -22,13 +22,16 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQuery,
+    InlineQueryResultArticle,
     InlineQueryResultCachedSticker,
+    InputTextMessageContent,
     Message,
     Update,
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -66,10 +69,13 @@ BOT_USERNAME = ""
 
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 PACK_RE = re.compile(r"(?:https?://)?t\.me/(?:addstickers|addemoji)/([A-Za-z0-9_]+)", re.I)
-TOKEN_RE = re.compile(r"^g:([A-Za-z0-9_-]+)\s*(.*)$", re.S)
+CODE_RE = re.compile(r"^[A-Z0-9_]{3,12}$")
+DEFAULT_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+TUTORIAL_TTL = 300
 
-# In-memory burst limiter. Mongo still stores long-term counters/statistics.
+# In-memory burst limiter and tutorial anti-spam state. Mongo stores long-term stats.
 rate_windows: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+tutorial_last_sent: dict[tuple[int, int], float] = {}
 
 
 def utcnow() -> datetime:
@@ -92,10 +98,18 @@ def command_arg(message: Message) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
+async def generate_unique_group_code(length: int = 5) -> str:
+    for _ in range(100):
+        code = "".join(secrets.choice(DEFAULT_CODE_ALPHABET) for _ in range(length))
+        if not await db.groups.find_one({"group_code": code}, {"_id": 1}):
+            return code
+    raise RuntimeError("Could not generate a unique group code")
+
+
 async def init_db() -> None:
     await mongo.admin.command({"ping": 1})
     await db.groups.create_index([("chat_id", ASCENDING)], unique=True)
-    await db.groups.create_index([("search_token", ASCENDING)], unique=True, sparse=True)
+    await db.groups.create_index([("group_code", ASCENDING)], unique=True, sparse=True)
     await db.users.create_index([("user_id", ASCENDING)], unique=True)
     await db.packs.create_index([("name", ASCENDING)], unique=True)
     await db.group_packs.create_index([("chat_id", ASCENDING), ("pack_name", ASCENDING)], unique=True)
@@ -107,43 +121,72 @@ async def init_db() -> None:
     await db.errors.create_index([("created_at", DESCENDING)])
     await db.errors.create_index("expire_at", expireAfterSeconds=0)
 
+    # Backfill codes for groups created by older versions of the bot.
+    async for row in db.groups.find({"group_code": {"$exists": False}}, {"chat_id": 1}):
+        while True:
+            code = await generate_unique_group_code()
+            try:
+                await db.groups.update_one(
+                    {"chat_id": row["chat_id"], "group_code": {"$exists": False}},
+                    {"$set": {"group_code": code}},
+                )
+                break
+            except DuplicateKeyError:
+                continue
+
 
 async def ensure_group(chat: Any) -> dict[str, Any]:
     now = utcnow()
-    token = secrets.token_urlsafe(8)
-    await db.groups.update_one(
-        {"chat_id": chat.id},
-        {
-            "$set": {
-                "title": getattr(chat, "title", None) or str(chat.id),
-                "username": getattr(chat, "username", None),
-                "active": True,
-                "last_seen": now,
+    existing = await db.groups.find_one({"chat_id": chat.id})
+    if existing:
+        updates = {
+            "title": getattr(chat, "title", None) or str(chat.id),
+            "username": getattr(chat, "username", None),
+            "active": True,
+            "last_seen": now,
+        }
+        if not existing.get("group_code"):
+            while True:
+                code = await generate_unique_group_code()
+                try:
+                    await db.groups.update_one({"chat_id": chat.id}, {"$set": {**updates, "group_code": code}})
+                    break
+                except DuplicateKeyError:
+                    continue
+        else:
+            await db.groups.update_one({"chat_id": chat.id}, {"$set": updates})
+        return await db.groups.find_one({"chat_id": chat.id}) or {}
+
+    while True:
+        code = await generate_unique_group_code()
+        doc = {
+            "chat_id": chat.id,
+            "title": getattr(chat, "title", None) or str(chat.id),
+            "username": getattr(chat, "username", None),
+            "active": True,
+            "last_seen": now,
+            "created_at": now,
+            "group_code": code,
+            "limit_count": 5,
+            "limit_window": 30,
+            "stats": {
+                "inline_queries": 0,
+                "stickers_sent": 0,
+                "deleted_stickers": 0,
+                "deleted_inline": 0,
+                "rate_deleted": 0,
+                "packs_added": 0,
+                "packs_removed": 0,
             },
-            "$setOnInsert": {
-                "created_at": now,
-                "search_token": token,
-                "limit_count": 5,
-                "limit_window": 30,
-                "stats": {
-                    "inline_queries": 0,
-                    "stickers_sent": 0,
-                    "deleted_stickers": 0,
-                    "deleted_inline": 0,
-                    "rate_deleted": 0,
-                    "packs_added": 0,
-                    "packs_removed": 0,
-                },
-            },
-        },
-        upsert=True,
-    )
-    doc = await db.groups.find_one({"chat_id": chat.id})
-    if doc and not doc.get("search_token"):
-        token = secrets.token_urlsafe(8)
-        await db.groups.update_one({"chat_id": chat.id}, {"$set": {"search_token": token}})
-        doc["search_token"] = token
-    return doc or {}
+        }
+        try:
+            await db.groups.insert_one(doc)
+            return doc
+        except DuplicateKeyError:
+            # Another update may have created this chat at the same time.
+            existing = await db.groups.find_one({"chat_id": chat.id})
+            if existing:
+                return existing
 
 
 async def touch_dm_user(user: Any) -> None:
@@ -265,6 +308,58 @@ async def safe_delete(message: Message) -> bool:
         return False
 
 
+async def delete_message_later(chat_id: int, message_id: int, delay: int = TUTORIAL_TTL) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+
+
+async def send_sticker_tutorial(message: Message, group: dict[str, Any]) -> None:
+    user = message.from_user
+    code = group.get("group_code")
+    if not user or user.is_bot or not code:
+        return
+
+    key = (message.chat.id, user.id)
+    now = asyncio.get_running_loop().time()
+    last = tutorial_last_sent.get(key, 0.0)
+    if now - last < TUTORIAL_TTL:
+        return
+    tutorial_last_sent[key] = now
+
+    mention = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Open Sticker Search",
+                switch_inline_query_current_chat=f"{code} ",
+            )
+        ]]
+    )
+    try:
+        sent = await bot.send_message(
+            message.chat.id,
+            f"{mention}, direct stickers are not allowed in this group.\n\n"
+            f"Use the approved sticker search instead. Group code: <code>{html.escape(code)}</code>\n"
+            "Tap the button below, then choose a sticker. You can also type an emoji or pack name to filter results.",
+            reply_markup=keyboard,
+        )
+        asyncio.create_task(delete_message_later(message.chat.id, sent.message_id))
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+
+
+def inline_info_result(result_id: str, title: str, description: str, message_text: str) -> InlineQueryResultArticle:
+    return InlineQueryResultArticle(
+        id=result_id,
+        title=title,
+        description=description,
+        input_message_content=InputTextMessageContent(message_text=message_text),
+    )
+
+
 async def extract_pack_name(message: Message) -> str | None:
     arg = command_arg(message)
     if arg:
@@ -328,11 +423,12 @@ async def cmd_help(message: Message) -> None:
         "/auth — owner authorizes a Telegram admin (reply)\n"
         "/unauth — owner removes authorization (reply)\n"
         "/mods — authorized admins\n"
+        "/code — view the group code; /code NEWCODE changes it\n"
         "/search — open this group's inline sticker search\n"
         "/stats — group stats\n"
         "/top — top packs/emojis\n"
         "/limit — view/set rate limit, e.g. <code>/limit 5 30</code>\n\n"
-        "Only the owner or an authorized Telegram admin can add/remove packs."
+        "Only the owner or an authorized Telegram admin can add/remove packs or change the group code."
     )
 
 
@@ -468,18 +564,65 @@ async def cmd_mods(message: Message) -> None:
     await message.answer("<b>Authorized admins</b>\n\n" + ("\n".join(rows) if rows else "None"))
 
 
+@router.message(Command("code"))
+async def cmd_code(message: Message) -> None:
+    if not await require_group(message):
+        return
+    group = await ensure_group(message.chat)
+    arg = command_arg(message).strip()
+    if not arg:
+        await message.answer(
+            f"Group code: <code>{html.escape(group['group_code'])}</code>\n\n"
+            f"Use <code>@{html.escape(BOT_USERNAME)} {html.escape(group['group_code'])}</code> to open this group's stickers."
+        )
+        return
+
+    if not message.from_user or not await can_manage(message.chat.id, message.from_user.id):
+        await message.answer("❌ Only the group owner or an authorized admin can change the group code.")
+        return
+
+    code = arg.upper()
+    if not CODE_RE.fullmatch(code):
+        await message.answer("❌ Use 3-12 characters: letters, numbers, or underscore only.")
+        return
+
+    if code == group.get("group_code"):
+        await message.answer(f"That is already this group's code: <code>{html.escape(code)}</code>.")
+        return
+
+    if await db.groups.find_one({"group_code": code, "chat_id": {"$ne": message.chat.id}}, {"_id": 1}):
+        await message.answer("❌ That code is already in use. Please choose another one.")
+        return
+
+    try:
+        await db.groups.update_one({"chat_id": message.chat.id}, {"$set": {"group_code": code}})
+    except DuplicateKeyError:
+        await message.answer("❌ That code is already in use. Please choose another one.")
+        return
+
+    await log_activity("code_change", chat=message.chat, user=message.from_user, details=code)
+    await message.answer(
+        f"✅ Group code changed to <code>{html.escape(code)}</code>.\n"
+        f"Users can now type <code>@{html.escape(BOT_USERNAME)} {html.escape(code)}</code>."
+    )
+
+
 @router.message(Command("search"))
 async def cmd_search(message: Message) -> None:
     if not await require_group(message):
         return
     group = await ensure_group(message.chat)
-    token = group["search_token"]
+    code = group["group_code"]
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Search stickers", switch_inline_query_current_chat=f"g:{token}")]
+            [InlineKeyboardButton(text="Open Sticker Search", switch_inline_query_current_chat=f"{code} ")]
         ]
     )
-    await message.answer("Tap below. Stickers will appear instantly; type an emoji or pack name only if you want to filter them.", reply_markup=keyboard)
+    await message.answer(
+        f"Group code: <code>{html.escape(code)}</code>\n\n"
+        "Tap below to open approved stickers. You can optionally type an emoji or pack name to filter them.",
+        reply_markup=keyboard,
+    )
 
 
 @router.message(Command("limit"))
@@ -546,36 +689,69 @@ async def cmd_top(message: Message) -> None:
 
 @router.inline_query()
 async def inline_search(query: InlineQuery) -> None:
-    match = TOKEN_RE.match(query.query or "")
-    if not match:
-        await query.answer([], cache_time=1, is_personal=True)
+    raw = (query.query or "").strip()
+
+    # Telegram does not provide the destination chat ID for an inline query.
+    # The group code safely identifies which group's sticker library to use.
+    if not raw:
+        username = f"@{BOT_USERNAME}" if BOT_USERNAME else "this bot"
+        result = inline_info_result(
+            "how_to_send",
+            "How to send stickers",
+            "Type your group's code after the bot username.",
+            f"How to send stickers:\n1. Find your group code with /code or /search.\n2. Type {username} GROUPCODE.\n3. Choose a sticker.\n\nYou can add an emoji or pack name after the code to filter results.",
+        )
+        await query.answer([result], cache_time=1, is_personal=True)
         return
 
-    token, search = match.group(1), match.group(2).strip()
-    group = await db.groups.find_one({"search_token": token, "active": True})
+    parts = raw.split(maxsplit=1)
+    code = parts[0].upper()
+    search = parts[1].strip() if len(parts) > 1 else ""
+    group = await db.groups.find_one({"group_code": code, "active": True})
     if not group:
-        await query.answer([], cache_time=1, is_personal=True)
+        results = [
+            inline_info_result(
+                "invalid_code",
+                "Invalid group code",
+                f"{code} is not a valid Sticker Guard group code.",
+                "Invalid group code. Open /code or /search inside your group to get the correct code.",
+            ),
+            inline_info_result(
+                "how_to_send_invalid",
+                "How to send stickers",
+                "Use the code shown in your group with /code or /search.",
+                "How to send stickers:\n1. Open /code or /search in your group.\n2. Type the bot username followed by that group code.\n3. Choose an approved sticker.",
+            ),
+        ]
+        await query.answer(results, cache_time=1, is_personal=True)
         return
 
-    # Prevent a leaked group token from granting sticker access to non-members.
+    # A group code may be shared, but it never grants access to non-members.
     status = await get_member_status(group["chat_id"], query.from_user.id)
     if status in {None, ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}:
-        await query.answer([], cache_time=1, is_personal=True)
+        result = inline_info_result(
+            "not_member",
+            "This code is not available to you",
+            "You must be a member of that group to use its sticker library.",
+            "You must be a member of the group linked to this code before you can use its sticker library.",
+        )
+        await query.answer([result], cache_time=1, is_personal=True)
         return
 
     allowed = []
     async for row in db.group_packs.find({"chat_id": group["chat_id"]}, {"pack_name": 1}):
         allowed.append(row["pack_name"])
     if not allowed:
-        await query.answer([], cache_time=1, is_personal=True)
+        result = inline_info_result(
+            "no_packs",
+            "No sticker packs enabled",
+            "The owner or an authorized admin must add a pack first.",
+            "No sticker packs are enabled for this group yet.",
+        )
+        await query.answer([result], cache_time=1, is_personal=True)
         return
 
     needle = search.casefold()
-
-    # Build all matching candidates first. When the user does not type a search
-    # term, this intentionally means every sticker from every pack enabled in
-    # this group is eligible. /search injects only the private group token, so
-    # stickers appear immediately without requiring an emoji/word.
     candidates: list[tuple[str, dict[str, Any]]] = []
     async for pack in db.packs.find({"name": {"$in": allowed}}):
         pack_match = bool(needle) and (
@@ -588,8 +764,16 @@ async def inline_search(query: InlineQuery) -> None:
                 continue
             candidates.append((pack["name"], sticker))
 
-    # Keep empty-query results useful: show stickers from the allowed packs
-    # immediately and support scrolling through more than the first 50.
+    if not candidates:
+        result = inline_info_result(
+            "no_results",
+            "No stickers found",
+            "Try another emoji or pack name.",
+            "No approved stickers matched that search. Try another emoji or pack name.",
+        )
+        await query.answer([result], cache_time=1, is_personal=True)
+        return
+
     try:
         start = max(0, int(query.offset or "0"))
     except ValueError:
@@ -602,15 +786,9 @@ async def inline_search(query: InlineQuery) -> None:
         results.append(InlineQueryResultCachedSticker(id=result_id, sticker_file_id=sticker["file_id"]))
 
     next_offset = str(start + 50) if start + 50 < len(candidates) else ""
-
     await bump_group(group["chat_id"], inline_queries=1)
     await bump_daily(group["chat_id"], inline_queries=1)
-    await query.answer(
-        results,
-        cache_time=1,
-        is_personal=True,
-        next_offset=next_offset,
-    )
+    await query.answer(results, cache_time=1, is_personal=True, next_offset=next_offset)
 
 
 @router.my_chat_member()
@@ -658,6 +836,8 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         if await safe_delete(message):
             await bump_group(message.chat.id, deleted_inline=1)
             await bump_daily(message.chat.id, deleted_inline=1)
+            if message.sticker:
+                await send_sticker_tutorial(message, group)
         return
 
     if not message.sticker:
@@ -668,6 +848,7 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         if await safe_delete(message):
             await bump_group(message.chat.id, deleted_stickers=1)
             await bump_daily(message.chat.id, deleted_stickers=1)
+            await send_sticker_tutorial(message, group)
         return
 
     set_name = message.sticker.set_name
@@ -675,6 +856,7 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         if await safe_delete(message):
             await bump_group(message.chat.id, deleted_stickers=1)
             await bump_daily(message.chat.id, deleted_stickers=1)
+            await send_sticker_tutorial(message, group)
         return
 
     if message.from_user:
@@ -824,6 +1006,7 @@ async def configure_bot() -> None:
             BotCommand(command="auth", description="Authorize a Telegram admin"),
             BotCommand(command="unauth", description="Remove admin authorization"),
             BotCommand(command="mods", description="List authorized admins"),
+            BotCommand(command="code", description="View or change the group code"),
             BotCommand(command="search", description="Search this group's stickers"),
             BotCommand(command="stats", description="Group sticker stats"),
             BotCommand(command="top", description="Top packs and emojis"),
