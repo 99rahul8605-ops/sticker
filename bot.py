@@ -72,10 +72,13 @@ PACK_RE = re.compile(r"(?:https?://)?t\.me/(?:addstickers|addemoji)/([A-Za-z0-9_
 CODE_RE = re.compile(r"^[A-Z0-9_]{3,12}$")
 DEFAULT_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 TUTORIAL_TTL = 300
+INLINE_HELP_MARKER = "[StickerGuard:help]"
+INLINE_INVALID_MARKER = "[StickerGuard:invalid]"
 
 # In-memory burst limiter and tutorial anti-spam state. Mongo stores long-term stats.
 rate_windows: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 tutorial_last_sent: dict[tuple[int, int], float] = {}
+tutorial_message_ids: dict[tuple[int, int], int] = {}
 
 
 def utcnow() -> datetime:
@@ -316,7 +319,13 @@ async def delete_message_later(chat_id: int, message_id: int, delay: int = TUTOR
         pass
 
 
-async def send_sticker_tutorial(message: Message, group: dict[str, Any]) -> None:
+async def send_sticker_tutorial(
+    message: Message,
+    group: dict[str, Any],
+    *,
+    force: bool = False,
+    direct_blocked: bool = True,
+) -> None:
     user = message.from_user
     code = group.get("group_code")
     if not user or user.is_bot or not code:
@@ -325,8 +334,19 @@ async def send_sticker_tutorial(message: Message, group: dict[str, Any]) -> None
     key = (message.chat.id, user.id)
     now = asyncio.get_running_loop().time()
     last = tutorial_last_sent.get(key, 0.0)
-    if now - last < TUTORIAL_TTL:
+    if not force and now - last < TUTORIAL_TTL:
         return
+
+    # A deliberately opened help result should always work, but replace the
+    # previous tutorial instead of stacking duplicate bot messages.
+    if force:
+        old_message_id = tutorial_message_ids.get(key)
+        if old_message_id:
+            try:
+                await bot.delete_message(message.chat.id, old_message_id)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+
     tutorial_last_sent[key] = now
 
     mention = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
@@ -338,17 +358,23 @@ async def send_sticker_tutorial(message: Message, group: dict[str, Any]) -> None
             )
         ]]
     )
+    intro = (
+        f"{mention}, direct stickers are not allowed in this group.\n"
+        if direct_blocked
+        else f"{mention}, use this group's approved sticker library.\n"
+    )
     try:
         sent = await bot.send_message(
             message.chat.id,
             "<b>How to send stickers</b>\n\n"
-            f"{mention}, direct stickers are not allowed in this group.\n"
-            f"Group code: <code>{html.escape(code)}</code>\n\n"
-            "Tap <b>Open Sticker Search</b> below. The group's code will be filled in automatically, "
-            "so you can choose an approved sticker immediately. You can also type an emoji or pack name to filter results.\n\n"
-            "This message will be removed automatically in 5 minutes.",
+            + intro
+            + f"Group code: <code>{html.escape(code)}</code>\n\n"
+            + "Tap <b>Open Sticker Search</b> below. The group's code will be filled in automatically, "
+            + "so you can choose an approved sticker immediately. You can also type an emoji or pack name to filter results.\n\n"
+            + "This message will be removed automatically in 5 minutes.",
             reply_markup=keyboard,
         )
+        tutorial_message_ids[key] = sent.message_id
         asyncio.create_task(delete_message_later(message.chat.id, sent.message_id))
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
@@ -723,12 +749,11 @@ async def inline_search(query: InlineQuery) -> None:
     # Telegram does not provide the destination chat ID for an inline query.
     # The group code safely identifies which group's sticker library to use.
     if not raw:
-        username = f"@{BOT_USERNAME}" if BOT_USERNAME else "this bot"
         result = inline_info_result(
             "how_to_send",
             "How to send stickers",
-            "Type your group's code after the bot username.",
-            f"How to send stickers:\n1. Find your group code with /code or /search.\n2. Type {username} GROUPCODE.\n3. Choose a sticker.\n\nYou can add an emoji or pack name after the code to filter results.",
+            "Tap to get this group's code and sticker-search button.",
+            f"{INLINE_HELP_MARKER}\nOpening this group's sticker guide…",
         )
         await query.answer([result], cache_time=1, is_personal=True)
         return
@@ -742,14 +767,14 @@ async def inline_search(query: InlineQuery) -> None:
             inline_info_result(
                 "invalid_code",
                 "Invalid group code",
-                f"{code} is not a valid Sticker Guard group code.",
-                "Invalid group code. Open /code or /search inside your group to get the correct code.",
+                f"{code} is not a valid Sticker Guard group code. Tap for the correct code in this group.",
+                f"{INLINE_INVALID_MARKER}\nInvalid group code. Loading this group's sticker guide…",
             ),
             inline_info_result(
                 "how_to_send_invalid",
                 "How to send stickers",
-                "Use the code shown in your group with /code or /search.",
-                "How to send stickers:\n1. Open /code or /search in your group.\n2. Type the bot username followed by that group code.\n3. Choose an approved sticker.",
+                "Tap to get this group's code and sticker-search button.",
+                f"{INLINE_HELP_MARKER}\nOpening this group's sticker guide…",
             ),
         ]
         await query.answer(results, cache_time=1, is_personal=True)
@@ -853,6 +878,20 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         return
 
     group = await ensure_group(message.chat)
+
+    # Inline help results cannot know the destination group while the user is
+    # browsing. Once the result is posted here, we do know the chat ID, so
+    # replace the temporary inline article with the real group-specific guide.
+    if (
+        message.via_bot
+        and message.via_bot.id == BOT_ID
+        and not message.sticker
+        and message.text
+        and (INLINE_HELP_MARKER in message.text or INLINE_INVALID_MARKER in message.text)
+    ):
+        await safe_delete(message)
+        await send_sticker_tutorial(message, group, force=True, direct_blocked=False)
+        return
 
     # Group owner and /auth-authorized admins may send stickers directly.
     # Normal Telegram admins are NOT exempt unless the owner authorized them.

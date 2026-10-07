@@ -139,3 +139,7 @@ https://YOUR-SERVICE.onrender.com/telegram/webhook
 ## Current custom-emoji status
 
 Custom-emoji packs are intentionally rejected for now. Regular, animated, and video sticker packs are supported. Custom emoji can be added later without changing the core permission/database model.
+
+### Inline help behavior
+
+Typing only `@YourBot` shows a **How to send stickers** inline result. When that result is selected inside a group, the bot replaces it with a group-specific tutorial containing the current group code and an **Open Sticker Search** button. The button reopens inline mode with the code already filled in. Invalid-code help uses the same recovery flow.
