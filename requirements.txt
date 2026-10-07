@@ -2,4 +2,3 @@ aiogram==3.31.0
 pymongo[srv]>=4.13,<5
 aiohttp>=3.10,<4
 python-dotenv>=1.0,<2
-nudenet==3.4.2

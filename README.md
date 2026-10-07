@@ -38,7 +38,6 @@ Telegram group sticker firewall with per-group approved sticker packs, short gro
 - `/stats` — group stats
 - `/top` — top packs/emojis
 - `/limit` — show limit; `/limit 5 30` sets 5 stickers per 30 seconds per user
-- `/safe` — view/configure NSFW protection
 - `/help`
 
 ### Bot owner (DM only)
@@ -94,9 +93,9 @@ shows a global **How to send stickers** help result because Telegram does not pr
 1. Create the bot and copy its token.
 2. Enable inline mode with `/setinline` in BotFather. Set the inline placeholder to `Enter group code...`.
 3. Add the bot to each group as an admin.
-4. Give it **Delete messages** and **Ban users** permissions. Delete is required to remove unsafe/blocked media; Ban users is required for mute/ban enforcement.
+4. Give it **Delete messages** permission. Without this, moderation cannot work.
 
-Other unrelated Telegram admin permissions are not required.
+The bot does not need unrelated Telegram admin permissions.
 
 ## MongoDB Atlas
 
@@ -114,35 +113,6 @@ python bot.py
 ```
 
 With no `WEBHOOK_URL`, the bot automatically uses long polling. The local status server still starts on `PORT` (default `10000`), so you can open `http://localhost:10000/`.
-
-## NSFW protection
-
-NSFW protection is enabled by default for every group. It runs locally on the bot server with NudeNet's bundled 320px ONNX model; media is not sent to a third-party moderation API.
-
-What is scanned:
-
-- Telegram photos
-- image documents (up to 10 MB)
-- static stickers
-- animated/video stickers via their Telegram thumbnail
-- GIF/animation messages via their Telegram thumbnail
-
-Default action: delete detected unsafe media and mute a normal member for 60 minutes. Group owners and owner-authorized admins can change the policy:
-
-```text
-/safe
-/safe on
-/safe off
-/safe mute 60
-/safe ban
-/safe threshold 0.85
-```
-
-The default threshold is `0.85`. Higher values reduce false positives but can miss more content. The detector is a moderation aid, not a perfect classifier, so permanent ban mode should be enabled only if you accept false-positive risk.
-
-If an unsafe sticker is detected after being offered by Sticker Guard itself, the message is deleted and that sticker is removed from the stored approved snapshot, but the user is not punished for selecting a sticker the bot offered. Pack snapshots are still not auto-synced.
-
-The bot needs Telegram admin permissions to **Delete messages** and **Ban/Restrict users** for full NSFW enforcement.
 
 ## Render deployment
 
