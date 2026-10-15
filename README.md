@@ -8,9 +8,10 @@ Telegram group sticker firewall with per-group approved sticker packs, short gro
 - Every group automatically receives a unique 5-character code such as `K7M2Q`.
 - Users type `@YourBot K7M2Q` to see that group's approved stickers.
 - Users can add an emoji or pack name after the code to filter results.
+- Each user gets a personal recent list per group: their last 10 approved stickers are shown first in inline results.
 - The group owner or an admin explicitly authorized with `/auth` can change the code with `/code NEWCODE` if the new code is available.
 - Direct/manual stickers from regular members and non-authorized Telegram admins are deleted.
-- The group owner and `/auth`-authorized admins may send stickers directly.
+- The group owner, Telegram admins, and users added with `/allow` may send stickers directly.
 - Inline sticker messages from other bots are deleted for regular members.
 - A sticker sent through this bot is kept only if its sticker pack is allowed in that exact group.
 - When a member sends a blocked sticker, the bot posts a short English tutorial with an **Open Sticker Search** button prefilled with that group's code.
@@ -32,6 +33,9 @@ Telegram group sticker firewall with per-group approved sticker packs, short gro
 - `/auth` — group owner replies to a Telegram admin to authorize them
 - `/unauth` — group owner replies to an authorized admin to revoke them
 - `/mods` — list authorized admins
+- `/allow` — reply to a user to allow direct stickers (owner/authorized manager)
+- `/unallow` — remove a replied user from the sticker allowlist
+- `/allowed` — list users allowed to send stickers directly
 - `/code` — show this group's code
 - `/code NEWCODE` — owner/authorized admin changes the code; 3-12 letters, numbers, or `_`
 - `/search` — open inline search with this group's code already filled in

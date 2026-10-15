@@ -123,6 +123,14 @@ async def init_db() -> None:
     await db.packs.create_index([("name", ASCENDING)], unique=True)
     await db.group_packs.create_index([("chat_id", ASCENDING), ("pack_name", ASCENDING)], unique=True)
     await db.managers.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    await db.allowed_users.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    await db.recent_stickers.create_index(
+        [("chat_id", ASCENDING), ("user_id", ASCENDING), ("file_unique_id", ASCENDING)],
+        unique=True,
+    )
+    await db.recent_stickers.create_index(
+        [("chat_id", ASCENDING), ("user_id", ASCENDING), ("last_used", DESCENDING)]
+    )
     await db.usage.create_index([("chat_id", ASCENDING), ("kind", ASCENDING), ("key", ASCENDING)], unique=True)
     await db.daily.create_index([("day", ASCENDING), ("chat_id", ASCENDING)], unique=True)
     await db.activity.create_index([("created_at", DESCENDING)])
@@ -262,6 +270,85 @@ async def bump_usage(chat_id: int, kind: str, key: str) -> None:
     )
 
 
+async def remember_recent_sticker(chat_id: int, user_id: int, sticker: Any) -> None:
+    """Keep a per-user, per-group MRU list of at most 10 approved stickers.
+
+    We only remember stickers that still exist in this group's approved snapshot.
+    This prevents an admin/allowlisted user's unrelated manual sticker from
+    displacing useful recent results in the inline picker.
+    """
+    set_name = getattr(sticker, "set_name", None)
+    file_unique_id = getattr(sticker, "file_unique_id", None)
+    file_id = getattr(sticker, "file_id", None)
+    if not set_name or not file_unique_id or not file_id:
+        return
+
+    linked = await db.group_packs.find_one(
+        {"chat_id": chat_id, "pack_name": set_name},
+        {"_id": 1},
+    )
+    if not linked:
+        return
+
+    # Packs are stored as an approval-time snapshot. Only remember a sticker
+    # that is present in that snapshot; later pack additions are not trusted.
+    approved_pack = await db.packs.find_one(
+        {"name": set_name, "stickers.file_unique_id": file_unique_id},
+        {"_id": 1},
+    )
+    if not approved_pack:
+        return
+
+    now = utcnow()
+    await db.recent_stickers.update_one(
+        {"chat_id": chat_id, "user_id": user_id, "file_unique_id": file_unique_id},
+        {
+            "$set": {
+                "file_id": file_id,
+                "pack_name": set_name,
+                "emoji": getattr(sticker, "emoji", None) or "",
+                "last_used": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+    stale_ids = []
+    cursor = (
+        db.recent_stickers.find(
+            {"chat_id": chat_id, "user_id": user_id},
+            {"_id": 1},
+        )
+        .sort("last_used", DESCENDING)
+        .skip(10)
+    )
+    async for row in cursor:
+        stale_ids.append(row["_id"])
+    if stale_ids:
+        await db.recent_stickers.delete_many({"_id": {"$in": stale_ids}})
+
+
+async def recent_sticker_rank(chat_id: int, user_id: int) -> dict[str, int]:
+    """Return file_unique_id -> MRU rank (0 is most recent)."""
+    ranks: dict[str, int] = {}
+    cursor = (
+        db.recent_stickers.find(
+            {"chat_id": chat_id, "user_id": user_id},
+            {"file_unique_id": 1},
+        )
+        .sort("last_used", DESCENDING)
+        .limit(10)
+    )
+    index = 0
+    async for row in cursor:
+        file_unique_id = row.get("file_unique_id")
+        if file_unique_id:
+            ranks[file_unique_id] = index
+            index += 1
+    return ranks
+
+
 async def get_member_status(chat_id: int, user_id: int) -> ChatMemberStatus | None:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
@@ -274,6 +361,17 @@ async def is_owner(chat_id: int, user_id: int) -> bool:
     return await get_member_status(chat_id, user_id) == ChatMemberStatus.CREATOR
 
 
+async def is_group_admin(chat_id: int, user_id: int) -> bool:
+    """Return True for the group owner or any Telegram administrator.
+
+    This is intentionally separate from can_manage(): all Telegram admins are
+    exempt from sticker moderation, while pack-management commands remain
+    limited to the owner and /auth-authorized admins.
+    """
+    status = await get_member_status(chat_id, user_id)
+    return status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}
+
+
 async def can_manage(chat_id: int, user_id: int) -> bool:
     status = await get_member_status(chat_id, user_id)
     if status == ChatMemberStatus.CREATOR:
@@ -281,6 +379,18 @@ async def can_manage(chat_id: int, user_id: int) -> bool:
     if status != ChatMemberStatus.ADMINISTRATOR:
         return False
     return bool(await db.managers.find_one({"chat_id": chat_id, "user_id": user_id}))
+
+
+async def is_sticker_allowlisted(chat_id: int, user_id: int) -> bool:
+    return bool(await db.allowed_users.find_one({"chat_id": chat_id, "user_id": user_id}, {"_id": 1}))
+
+
+async def is_sticker_exempt(chat_id: int, user_id: int) -> bool:
+    # Telegram owner/admins are exempt, plus regular users explicitly added
+    # by the group owner or an /auth-authorized manager via /allow.
+    if await is_group_admin(chat_id, user_id):
+        return True
+    return await is_sticker_allowlisted(chat_id, user_id)
 
 
 async def require_group(message: Message) -> bool:
@@ -483,12 +593,15 @@ async def cmd_help(message: Message) -> None:
         "/auth — owner authorizes a Telegram admin (reply)\n"
         "/unauth — owner removes authorization (reply)\n"
         "/mods — authorized admins\n"
+        "/allow — allow a user to send stickers directly (reply)\n"
+        "/unallow — remove a user from the sticker allowlist (reply)\n"
+        "/allowed — sticker allowlist\n"
         "/code — view the group code; /code NEWCODE changes it\n"
         "/search — open this group's inline sticker search\n"
         "/stats — group stats\n"
         "/top — top packs/emojis\n"
         "/limit — view/set rate limit, e.g. <code>/limit 5 30</code>\n\n"
-        "Only the group owner or an owner-authorized Telegram admin can add/remove packs or change the group code.",
+        "Only the group owner or an owner-authorized Telegram admin can manage packs, group code, and the sticker allowlist.",
         reply_markup=keyboard,
     )
 
@@ -625,6 +738,57 @@ async def cmd_mods(message: Message) -> None:
     await message.answer("<b>Authorized admins</b>\n\n" + ("\n".join(rows) if rows else "None"))
 
 
+@router.message(Command("allow"))
+async def cmd_allow(message: Message) -> None:
+    if not await require_manager(message):
+        return
+    target = message.reply_to_message.from_user if message.reply_to_message else None
+    if not target or target.is_bot:
+        await message.answer("Reply to the user you want to allow, then send /allow.")
+        return
+    await db.allowed_users.update_one(
+        {"chat_id": message.chat.id, "user_id": target.id},
+        {
+            "$set": {
+                "username": target.username,
+                "name": target.full_name,
+                "allowed_by": message.from_user.id,
+                "allowed_at": utcnow(),
+            }
+        },
+        upsert=True,
+    )
+    await log_activity("sticker_allow_add", chat=message.chat, user=message.from_user, details=f"user_id={target.id}")
+    await message.answer(f"✅ {html.escape(target.full_name)} can now send stickers directly.")
+
+
+@router.message(Command("unallow"))
+async def cmd_unallow(message: Message) -> None:
+    if not await require_manager(message):
+        return
+    target = message.reply_to_message.from_user if message.reply_to_message else None
+    if not target:
+        await message.answer("Reply to an allowed user, then send /unallow.")
+        return
+    result = await db.allowed_users.delete_one({"chat_id": message.chat.id, "user_id": target.id})
+    if not result.deleted_count:
+        await message.answer("That user is not on the sticker allowlist.")
+        return
+    await log_activity("sticker_allow_remove", chat=message.chat, user=message.from_user, details=f"user_id={target.id}")
+    await message.answer(f"✅ Sticker allowlist access removed for {html.escape(target.full_name)}.")
+
+
+@router.message(Command("allowed"))
+async def cmd_allowed(message: Message) -> None:
+    if not await require_group(message):
+        return
+    rows = []
+    async for row in db.allowed_users.find({"chat_id": message.chat.id}).sort("allowed_at", ASCENDING):
+        label = f"@{row['username']}" if row.get("username") else row.get("name") or str(row["user_id"])
+        rows.append(f"• {html.escape(label)}")
+    await message.answer("<b>Sticker allowlist</b>\n\n" + ("\n".join(rows) if rows else "None"))
+
+
 @router.message(Command("code"))
 async def cmd_code(message: Message) -> None:
     if not await require_group(message):
@@ -719,10 +883,12 @@ async def cmd_stats(message: Message) -> None:
     today = await db.daily.find_one({"day": today_key(), "chat_id": message.chat.id}) or {}
     packs = await db.group_packs.count_documents({"chat_id": message.chat.id})
     managers = await db.managers.count_documents({"chat_id": message.chat.id})
+    allowed_users = await db.allowed_users.count_documents({"chat_id": message.chat.id})
     await message.answer(
         "<b>📊 Group stats</b>\n\n"
         f"Packs: <b>{packs}</b>\n"
         f"Authorized admins: <b>{managers}</b>\n"
+        f"Sticker allowlist: <b>{allowed_users}</b>\n"
         f"Stickers sent: <b>{stats.get('stickers_sent', 0)}</b> (today {today.get('stickers_sent', 0)})\n"
         f"Inline searches: <b>{stats.get('inline_queries', 0)}</b> (today {today.get('inline_queries', 0)})\n"
         f"Unauthorized stickers deleted: <b>{stats.get('deleted_stickers', 0)}</b>\n"
@@ -834,6 +1000,15 @@ async def inline_search(query: InlineQuery) -> None:
         await query.answer([result], cache_time=1, is_personal=True)
         return
 
+    # Personalize results: the user's last 10 approved stickers in this group
+    # are moved to the top. Search still filters normally; matching recents get
+    # priority, while stickers removed from the group simply cannot appear.
+    recent_rank = await recent_sticker_rank(group["chat_id"], query.from_user.id)
+    if recent_rank:
+        candidates.sort(
+            key=lambda item: recent_rank.get(item[1].get("file_unique_id", ""), 10_000)
+        )
+
     try:
         start = max(0, int(query.offset or "0"))
     except ValueError:
@@ -873,6 +1048,8 @@ async def record_allowed_sticker(message: Message) -> None:
         await bump_usage(message.chat.id, "pack", sticker.set_name)
     if sticker.emoji:
         await bump_usage(message.chat.id, "emoji", sticker.emoji)
+    if message.from_user:
+        await remember_recent_sticker(message.chat.id, message.from_user.id, sticker)
 
 
 @router.message(F.sticker | F.via_bot)
@@ -899,9 +1076,9 @@ async def moderation_and_dm_catchall(message: Message) -> None:
         await send_sticker_tutorial(message, group, force=True, direct_blocked=False)
         return
 
-    # Group owner and /auth-authorized admins may send stickers directly.
-    # Normal Telegram admins are NOT exempt unless the owner authorized them.
-    if message.sticker and message.from_user and await can_manage(message.chat.id, message.from_user.id):
+    # Telegram group admins and users explicitly added with /allow may send
+    # stickers directly. /allow does not grant pack-management permissions.
+    if message.sticker and message.from_user and await is_sticker_exempt(message.chat.id, message.from_user.id):
         await record_allowed_sticker(message)
         return
 
