@@ -558,13 +558,49 @@ async def cmd_start(message: Message) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    group_commands = (
+        "<b>Group commands & usage</b>\n\n"
+        "<code>/add</code> — reply to a sticker to add its pack\n"
+        "<code>/add PACK_LINK</code> — add a pack by link or pack name\n\n"
+        "<code>/rm</code> — reply to a sticker to remove its pack\n"
+        "<code>/rm PACK_LINK</code> — remove a pack by link or pack name\n\n"
+        "<code>/packs</code> — list this group's approved sticker packs\n\n"
+        "<code>/auth</code> — reply to a Telegram admin to authorize pack management <i>(owner only)</i>\n"
+        "<code>/unauth</code> — reply to an authorized admin to remove authorization <i>(owner only)</i>\n"
+        "<code>/mods</code> — list authorized pack managers\n\n"
+        "<code>/allow</code> — reply to a user to allow direct sticker sending\n"
+        "<code>/unallow</code> — reply to a user to remove direct-sticker access\n"
+        "<code>/allowed</code> — list sticker-allowlisted users\n\n"
+        "<code>/code</code> — show this group's sticker code\n"
+        "<code>/code MEME</code> — change the group code (3–12 letters/numbers/_)\n\n"
+        "<code>/search</code> — open this group's inline sticker library\n"
+        "<code>/limit</code> — show the current per-user sticker rate limit\n"
+        "<code>/limit 5 30</code> — allow 5 stickers per 30 seconds\n\n"
+        "<code>/stats</code> — show this group's sticker/moderation stats\n"
+        "<code>/top</code> — show top sticker packs and emojis\n"
+        "<code>/help</code> — show this help message\n"
+    )
+
     if message.chat.type == ChatType.PRIVATE:
         await touch_dm_user(message.from_user)
+        owner_commands = ""
+        if message.from_user and message.from_user.id == BOT_OWNER_ID:
+            owner_commands = (
+                "\n\n<b>Bot owner commands (DM only)</b>\n\n"
+                "<code>/bstats</code> — global bot stats\n"
+                "<code>/activity</code> — recent bot/group activity\n"
+                "<code>/groups</code> — group totals and top groups\n"
+                "<code>/users</code> — DM user totals/activity\n"
+                "<code>/errors</code> — recent recorded errors"
+            )
         await message.answer(
-            "<b>Sticker Guard</b>\n\n"
-            "Add me to a group as an admin with <b>Delete messages</b> permission. "
-            "Each group gets its own sticker code and approved sticker packs.\n\n"
-            "Use the group commands inside the group."
+            "<b>Sticker Guard Help</b>\n\n"
+            "<code>/start</code> — start the bot / show setup info\n"
+            "<code>/help</code> — show all commands and usage\n\n"
+            "Add the bot to a group as an admin with <b>Delete messages</b> permission. "
+            "Each group gets its own code and approved sticker library.\n\n"
+            + group_commands
+            + owner_commands
         )
         return
 
@@ -582,26 +618,16 @@ async def cmd_help(message: Message) -> None:
         ]]
     )
     await message.answer(
-        "<b>How to send stickers</b>\n\n"
+        "<b>Sticker Guard Help</b>\n\n"
         f"Group code: <code>{html.escape(code)}</code>\n"
-        "Tap <b>Open Sticker Search</b> below to open the approved sticker library with this group's code already filled in. "
-        "You can also type an emoji or pack name after the code to filter stickers.\n\n"
-        "<b>Group commands</b>\n"
-        "/add — add pack (reply to a sticker or give pack link/name)\n"
-        "/rm — remove pack\n"
-        "/packs — allowed packs\n"
-        "/auth — owner authorizes a Telegram admin (reply)\n"
-        "/unauth — owner removes authorization (reply)\n"
-        "/mods — authorized admins\n"
-        "/allow — allow a user to send stickers directly (reply)\n"
-        "/unallow — remove a user from the sticker allowlist (reply)\n"
-        "/allowed — sticker allowlist\n"
-        "/code — view the group code; /code NEWCODE changes it\n"
-        "/search — open this group's inline sticker search\n"
-        "/stats — group stats\n"
-        "/top — top packs/emojis\n"
-        "/limit — view/set rate limit, e.g. <code>/limit 5 30</code>\n\n"
-        "Only the group owner or an owner-authorized Telegram admin can manage packs, group code, and the sticker allowlist.",
+        f"Inline: <code>@{html.escape(BOT_USERNAME)} {html.escape(code)}</code>\n\n"
+        "Tap <b>Open Sticker Search</b> to open this group's approved sticker library. "
+        "You can add an emoji or pack name after the code to filter results.\n\n"
+        + group_commands
+        + "\n<b>Permissions</b>\n"
+        "• Pack/code/allowlist management: group owner or <code>/auth</code>-authorized admin\n"
+        "• <code>/auth</code> and <code>/unauth</code>: group owner only\n"
+        "• Telegram admins and <code>/allow</code>-listed users can send stickers directly.",
         reply_markup=keyboard,
     )
 
@@ -1257,6 +1283,9 @@ async def configure_bot() -> None:
             BotCommand(command="auth", description="Authorize a Telegram admin"),
             BotCommand(command="unauth", description="Remove admin authorization"),
             BotCommand(command="mods", description="List authorized admins"),
+            BotCommand(command="allow", description="Allow a user to send stickers directly"),
+            BotCommand(command="unallow", description="Remove direct-sticker access"),
+            BotCommand(command="allowed", description="List sticker-allowlisted users"),
             BotCommand(command="code", description="View or change the group code"),
             BotCommand(command="search", description="Search this group's stickers"),
             BotCommand(command="stats", description="Group sticker stats"),
